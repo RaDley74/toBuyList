@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  shopping_bot:
+    build: .
+    container_name: shopping_list_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      # Это ВАЖНО: сохраняем базу данных на сервере, 
+      # чтобы при обновлении контейнера список покупок не удалился
+      - ./shopping_list.db:/app/shopping_list.db
