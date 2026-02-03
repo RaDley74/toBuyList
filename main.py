@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import aiosqlite
-import secrets  # Для генерации случайных токенов
+import secrets
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
@@ -44,21 +44,29 @@ async def init_db():
                 product_name TEXT
             )
         """)
-        # История
+        # История с счетчиком (добавлена колонка count)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 user_id INTEGER,
                 product_name TEXT,
+                count INTEGER DEFAULT 1,
                 UNIQUE(user_id, product_name)
             )
         """)
-        # Таблица токенов для безопасного шеринга
+        # Таблица токенов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS share_tokens (
                 user_id INTEGER PRIMARY KEY,
                 token TEXT UNIQUE
             )
         """)
+        
+        # Миграция: если колонка count не существует (для старых баз данных)
+        try:
+            await db.execute("ALTER TABLE history ADD COLUMN count INTEGER DEFAULT 1")
+        except:
+            pass # Колонка уже есть
+            
         await db.commit()
 
 # --- 3. ФУНКЦИИ БЕЗОПАСНОСТИ ---
@@ -69,8 +77,6 @@ async def get_or_create_token(user_id: int):
             row = await cursor.fetchone()
             if row:
                 return row[0]
-            
-            # Если токена нет, создаем новый (12 случайных символов)
             new_token = secrets.token_urlsafe(12)
             await db.execute("INSERT INTO share_tokens (user_id, token) VALUES (?, ?)", (user_id, new_token))
             await db.commit()
@@ -99,7 +105,6 @@ async def get_products_inline_kb(owner_id, viewer_id):
     
     builder = InlineKeyboardBuilder()
     for index, (item_id, name) in enumerate(rows, start=1):
-        # Передаем OWNER_ID, чтобы удаление работало корректно
         builder.row(InlineKeyboardButton(text=f"{index}. {name} ❌", callback_data=f"del_{item_id}_{owner_id}"))
     
     if owner_id == viewer_id:
@@ -108,8 +113,15 @@ async def get_products_inline_kb(owner_id, viewer_id):
 
 async def get_history_suggestions_kb(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT product_name FROM history WHERE user_id = ? LIMIT 10", (user_id,)) as cursor:
+        # Сортируем по убыванию count, чтобы популярные были первыми
+        async with db.execute("""
+            SELECT product_name FROM history 
+            WHERE user_id = ? 
+            ORDER BY count DESC 
+            LIMIT 10
+        """, (user_id,)) as cursor:
             rows = await cursor.fetchall()
+    
     builder = InlineKeyboardBuilder()
     for (name,) in rows:
         builder.row(InlineKeyboardButton(text=f"💡 {name}", callback_data=f"hist_add_{name}"))
@@ -124,41 +136,32 @@ dp = Dispatcher()
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
-    
-    # Если зашли по ссылке share_TOKEN
     if command.args and command.args.startswith("share_"):
         token = command.args.replace("share_", "")
         owner_id = await get_user_by_token(token)
-        
         if owner_id:
             try:
                 owner_chat = await bot.get_chat(owner_id)
                 owner_info = f"{owner_chat.first_name} {owner_chat.last_name or ''} (@{owner_chat.username or 'no_user'})"
             except:
                 owner_info = "Владелец списка"
-
             kb = await get_products_inline_kb(owner_id, message.from_user.id)
             await message.answer(f"👤 Список пользователя:\n<b>{owner_info}</b>\n\nНажмите на продукт, чтобы удалить его:", 
                                  reply_markup=kb, parse_mode="HTML")
             return
         else:
             await message.answer("⚠️ Ссылка недействительна или устарела.")
-
     await message.answer(f"Привет, {message.from_user.first_name}! Твой список покупок:", reply_markup=get_main_inline_kb())
 
 @dp.callback_query(F.data == "share_link")
 async def share_link(callback: types.CallbackQuery):
     token = await get_or_create_token(callback.from_user.id)
-    # Создаем безопасную ссылку с токеном вместо ID
     link = await create_start_link(bot, f"share_{token}", encode=False)
-    
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔄 Обновить ссылку (старая сгорит)", callback_data="refresh_token"))
+    builder.row(InlineKeyboardButton(text="🔄 Обновить ссылку", callback_data="refresh_token"))
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu"))
-
     await callback.message.edit_text(
-        f"🔗 Твоя секретная ссылка для доступа к списку:\n\n<code>{link}</code>\n\n"
-        "Тот, у кого есть эта ссылка, сможет удалять продукты из твоего списка.",
+        f"🔗 Твоя секретная ссылка:\n\n<code>{link}</code>\n\n",
         parse_mode="HTML", reply_markup=builder.as_markup()
     )
 
@@ -168,7 +171,7 @@ async def refresh_token(callback: types.CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE share_tokens SET token = ? WHERE user_id = ?", (new_token, callback.from_user.id))
         await db.commit()
-    await callback.answer("Ссылка обновлена. Старая больше не работает!")
+    await callback.answer("Ссылка обновлена.")
     await share_link(callback)
 
 @dp.callback_query(F.data == "main_menu")
@@ -183,12 +186,10 @@ async def view_list(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_item(callback: types.CallbackQuery):
-    # del_ITEMID_OWNERID
     _, item_id, owner_id = callback.data.split("_")
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM items WHERE id = ?", (item_id,))
         await db.commit()
-    
     kb = await get_products_inline_kb(int(owner_id), callback.from_user.id)
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer("Удалено")
@@ -219,16 +220,27 @@ async def add_from_history(callback: types.CallbackQuery):
 
 @dp.message(ListStates.waiting_for_product)
 async def process_text(message: types.Message):
-    await save_to_db(message.from_user.id, message.text)
+    # Очищаем текст от лишних пробелов и приводим к нижнему регистру для точности счета
+    product = message.text.strip().capitalize()
+    await save_to_db(message.from_user.id, product)
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="✅ Да", callback_data="add_more_yes"),
                 InlineKeyboardButton(text="❌ Нет", callback_data="main_menu"))
-    await message.answer(f"Добавлено. Еще?", reply_markup=builder.as_markup())
+    await message.answer(f"Добавлено: {product}. Еще?", reply_markup=builder.as_markup())
 
 async def save_to_db(uid, prod):
     async with aiosqlite.connect(DB_NAME) as db:
+        # Добавляем в текущий список
         await db.execute("INSERT INTO items (user_id, product_name) VALUES (?, ?)", (uid, prod))
-        await db.execute("INSERT OR IGNORE INTO history (user_id, product_name) VALUES (?, ?)", (uid, prod))
+        
+        # Обновляем историю: если товар уже есть, увеличиваем count на 1
+        await db.execute("""
+            INSERT INTO history (user_id, product_name, count) 
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, product_name) 
+            DO UPDATE SET count = count + 1
+        """, (uid, prod))
+        
         await db.commit()
 
 async def main():
