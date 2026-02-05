@@ -113,18 +113,21 @@ async def get_products_inline_kb(owner_id, viewer_id):
 
 async def get_history_suggestions_kb(user_id):
     async with aiosqlite.connect(DB_NAME) as db:
-        # Сортируем по убыванию count, чтобы популярные были первыми
+        # Сортируем по убыванию count, исключая то, что уже в списке
         async with db.execute("""
             SELECT product_name FROM history 
             WHERE user_id = ? 
+            AND product_name NOT IN (SELECT product_name FROM items WHERE user_id = ?)
             ORDER BY count DESC 
             LIMIT 10
-        """, (user_id,)) as cursor:
+        """, (user_id, user_id)) as cursor:
             rows = await cursor.fetchall()
     
     builder = InlineKeyboardBuilder()
     for (name,) in rows:
         builder.row(InlineKeyboardButton(text=f"💡 {name}", callback_data=f"hist_add_{name}"))
+    
+    # Если список пуст (все популярные товары уже в корзине), можно добавить уведомление или просто кнопку Назад
     builder.row(InlineKeyboardButton(text="⬅️ Отмена", callback_data="main_menu"))
     return builder.as_markup()
 
